@@ -1,4 +1,3 @@
----
 # Copyright 2025 DataRobot, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,39 +14,71 @@
 general:
   front_end:
     _type: dragent_fastapi
-    # Step adaptor is not necessary for custom agents
     step_adaptor:
-      mode: 'off'
-    # If you don't want your agent to expose A2A endpoints, remove the following block.
+      mode: "off"
     a2a:
       server:
-        name: Blog Content Writer
-        description: An AI content writing agent that researches and writes well-structured blog posts. Provide a topic and
-          it will generate a concise, publication-ready article in markdown format.
-      skills:  # Optional: advertise specific skills in the agent card
-        - id: write_blog
-          name: Write Blog Post
-          description: Researches and writes a blog post on the given topic.
-          tags: []
+        name: "AI Travel Planner"
+        description: >
+          A multi-agent AI Travel Planner that creates personalised trip itineraries.
+          Tell it your destination, travel dates, budget, and style preferences —
+          it will research flights, weather, local info, calculate your budget breakdown,
+          convert currencies, and produce a complete day-by-day itinerary.
+          Supports single-shot and multi-turn conversations with Human-in-the-Loop clarification.
+      skills:
+        - id: plan_trip
+          name: "Plan a Trip"
+          description: >
+            Creates a full travel plan including flights, weather, budget breakdown,
+            currency conversion, and a personalised day-by-day itinerary.
+          tags:
+            - travel
+            - planning
+            - itinerary
           examples:
-            - Write a blog post about the future of AI in healthcare
-            - Create an article about sustainable energy trends
-# To connect this agent to a remote A2A agent, uncomment the block below and add the
-# function group name to the workflow's tool_names list.
-# function_groups:
-#   remote_agent:
-#     _type: authenticated_a2a_client
-#     url: "https://app.datarobot.com/api/v2/deployments/<deployment-id>/directAccess/a2a/"
-#     auth_provider: datarobot_auth
+            - "Plan me a 5-day trip to Rome with a budget of $1200. I love food and history."
+            - "I want to go somewhere warm in Europe for a week under $2000."
+            - "Plan a 7-day adventure trip to Japan from London, budget $3000."
+        - id: budget_analysis
+          name: "Analyse Travel Budget"
+          description: >
+            Breaks down a travel budget across flights, hotel, food, activities,
+            and local transport. Converts amounts to the destination's local currency.
+          tags:
+            - budget
+            - finance
+            - currency
+          examples:
+            - "How far will $1500 go in Thailand for 10 days?"
+            - "Convert my $2000 budget to Euros for a Paris trip."
+        - id: destination_research
+          name: "Research a Destination"
+          description: >
+            Fetches current weather, country facts (language, currency, timezone),
+            and available flights for a destination.
+          tags:
+            - research
+            - weather
+            - flights
+          examples:
+            - "What's the weather like in Bali right now?"
+            - "Find flights from London to Tokyo in June."
+            - "Tell me about Japan: language, currency, and best time to visit."
+
 llms:
   datarobot_llm:
     _type: datarobot-llm-component
+
 workflow:
   _type: langgraph_agent
   llm_name: datarobot_llm
-  description: LangGraph planner/writer agent
-  # tool_names:
-  #   - remote_agent
+  description: >
+    Multi-agent AI Travel Planner: Research Agent (weather, flights, country info) →
+    Budget Agent (currency conversion, cost breakdown) →
+    Planner Agent (day-by-day itinerary, PII removal).
+    Orchestrated by a Supervisor node with conditional LangGraph edges.
+    Supports Human-in-the-Loop clarification for incomplete requests.
+
 authentication:
   datarobot_auth:
     _type: datarobot_api_key
