@@ -11,28 +11,130 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from datetime import datetime
-from typing import Any, Optional, Union
+"""AI Travel Planner Agent.
 
-from datarobot_genai.core.agents import (
-    make_system_prompt,
-)
+Multi-agent LangGraph workflow with:
+  - intake_node      : extracts structured trip fields from user message
+  - clarify_node     : interrupts to ask missing-field questions (Human-in-the-Loop)
+  - supervisor_node  : conditional routing hub that decides which specialist runs next
+  - research_node    : weather, country info, flight search
+  - budget_node      : currency conversion + budget breakdown
+  - planner_node     : itinerary builder, datetime, PII remover
+"""
+# ruff: noqa: I001
+
+from typing import Any, Literal, Optional, Union
+
+from ag_ui.core import RunAgentInput
+from datarobot_genai.core.agents import make_system_prompt
+from datarobot_genai.core.agents.base import extract_user_prompt_content
 from datarobot_genai.langgraph.agent import LangGraphAgent
 from langchain.agents import create_agent
 from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.tools import BaseTool
 from langchain_litellm.chat_models import ChatLiteLLM
 from langgraph.graph import END, START, MessagesState, StateGraph
+from langgraph.types import Command
+from pydantic import BaseModel, Field
 
+from agent.tools.budget_tools import calculate_budget_breakdown, convert_currency
+from agent.tools.planner_tools import build_itinerary, get_current_datetime, remove_pii
+from agent.tools.research_tools import get_country_info, get_destination_weather, search_flights
 from agent.config import Config
 
 
+# ---------------------------------------------------------------------------
+# Shared typed state
+# ---------------------------------------------------------------------------
+
+
+class TravelState(MessagesState):
+    """Shared state passed between all nodes in the travel planner workflow."""
+
+    # Extracted trip parameters
+    destination: str
+    origin: str
+    travel_dates: str
+    num_days: int
+    budget_usd: float
+    travel_style: str
+    currency: str
+
+    # Sub-agent result buckets
+    research_results: dict[str, Any]
+    budget_results: dict[str, Any]
+    itinerary: dict[str, Any]
+
+    # Workflow control
+    needs_clarification: bool
+    clarification_question: str
+    next_agent: str  # "research" | "budget" | "planner" | "FINISH"
+    completed_steps: list[str]
+
+
+# ---------------------------------------------------------------------------
+# Pydantic model for structured intake extraction
+# ---------------------------------------------------------------------------
+
+
+class TripIntakeModel(BaseModel):
+    """Structured fields extracted from the user's travel request.
+
+    Every field is required in the JSON schema so DataRobot's response_format
+    validation passes. Use empty string / 0 / False as sentinel values for
+    fields the user has not yet provided.
+    """
+
+    model_config = {"populate_by_name": True}
+
+    destination: str = Field(description="Travel destination extracted from the message, e.g. 'Rome, Italy'. Use empty string '' if not mentioned.")
+    origin: str = Field(description="Departure city or airport, e.g. 'London'. Use empty string '' if not mentioned.")
+    travel_dates: str = Field(description="Travel dates or duration, e.g. 'June 10-15 2025' or '5 days'. Use empty string '' if not mentioned.")
+    num_days: int = Field(description="Number of travel days as integer, e.g. 5. Use 0 if not mentioned.")
+    budget_usd: float = Field(description="Total trip budget converted to USD as a float, e.g. 1200.0. Use 0.0 if not mentioned.")
+    travel_style: str = Field(description="Travel preferences, e.g. 'culture, food, adventure, relaxation'. Use empty string '' if not mentioned.")
+    currency: str = Field(description="Preferred local currency code ISO 4217, e.g. 'EUR'. Use 'USD' if not mentioned.")
+    needs_clarification: bool = Field(description="Set to true if any of these required fields are still empty/zero after extraction: destination, origin, num_days, budget_usd.")
+    clarification_question: str = Field(description="A single friendly question asking for only the most critical missing field. Use empty string '' if needs_clarification is false.")
+
+
+# ---------------------------------------------------------------------------
+# Conditional edge routing functions
+# ---------------------------------------------------------------------------
+
+
+def _route_intake(state: TravelState) -> Literal["clarify_node", "supervisor_node"]:
+    if state.get("needs_clarification", False):
+        return "clarify_node"
+    return "supervisor_node"
+
+
+def _route_supervisor(
+    state: TravelState,
+) -> Literal["research_node", "budget_node", "planner_node", "presenter_node"]:
+    next_agent = state.get("next_agent", "research")
+    mapping: dict[str, Literal["research_node", "budget_node", "planner_node", "presenter_node"]] = {
+        "research": "research_node",
+        "budget": "budget_node",
+        "planner": "planner_node",
+        "FINISH": "presenter_node",
+    }
+    return mapping.get(next_agent, "presenter_node")
+
+
+# ---------------------------------------------------------------------------
+# MyAgent
+# ---------------------------------------------------------------------------
+
+
 class MyAgent(LangGraphAgent):
-    """MyAgent is a custom agent that uses Langgraph to plan and write content.
-    It utilizes DataRobot's LLM Gateway or a specific deployment for language model interactions.
-    This example illustrates 2 agents that handle content creation tasks, including planning
-    and writing blog posts.
+    """AI Travel Planner — multi-agent LangGraph workflow.
+
+    Orchestrates three specialist sub-agents (Research, Budget, Planner) via a
+    Supervisor node that uses conditional edges. Supports both single-shot and
+    multi-turn conversations with Human-in-the-Loop clarification.
     """
 
     def __init__(
@@ -41,34 +143,12 @@ class MyAgent(LangGraphAgent):
         api_base: Optional[str] = None,
         model: Optional[str] = None,
         verbose: Optional[Union[bool, str]] = True,
-        timeout: Optional[int] = 90,
+        timeout: Optional[int] = 120,
         *,
         llm: Optional[BaseChatModel] = None,
         workflow_tools: Optional[list[BaseTool]] = None,
         **kwargs: Any,
     ):
-        """Initializes the MyAgent class with API key, base URL, model, and verbosity settings.
-
-        Args:
-            api_key: Optional[str]: API key for authentication with DataRobot services.
-                Defaults to None, in which case it will use the DATAROBOT_API_TOKEN environment variable.
-            api_base: Optional[str]: Base URL for the DataRobot API.
-                Defaults to None, in which case it will use the DATAROBOT_ENDPOINT environment variable.
-            model: Optional[str]: The LLM model to use.
-                Defaults to None.
-            verbose: Optional[Union[bool, str]]: Whether to enable verbose logging.
-                Accepts boolean or string values ("true"/"false"). Defaults to True.
-            timeout: Optional[int]: How long to wait for the agent to respond.
-                Defaults to 90 seconds.
-            llm: Optional[BaseChatModel]: Pre-configured LLM instance provided by NAT.
-                When set, llm() returns this directly instead of creating a ChatLiteLLM.
-            workflow_tools: Optional[list[BaseTool]]: Additional tools from the workflow config (e.g. A2A client tools). Keyword-only.
-            **kwargs: Any: Additional keyword arguments passed to the agent.
-                Contains any parameters received in the CompletionCreateParams.
-
-        Returns:
-            None
-        """
         super().__init__(
             api_key=api_key,
             api_base=api_base,
@@ -84,35 +164,9 @@ class MyAgent(LangGraphAgent):
         if model in ("unknown", "datarobot-deployed-llm"):
             self.model = self.default_model
 
-    @property
-    def workflow(self) -> StateGraph[MessagesState]:
-        langgraph_workflow = StateGraph[
-            MessagesState, None, MessagesState, MessagesState
-        ](MessagesState)
-        langgraph_workflow.add_node("planner_node", self.agent_planner)
-        langgraph_workflow.add_node("writer_node", self.agent_writer)
-        langgraph_workflow.add_edge(START, "planner_node")
-        langgraph_workflow.add_edge("planner_node", "writer_node")
-        langgraph_workflow.add_edge("writer_node", END)
-        return langgraph_workflow  # type: ignore[return-value]
-
-    @property
-    def prompt_template(self) -> ChatPromptTemplate:
-        return ChatPromptTemplate.from_messages(
-            [
-                (
-                    "system",
-                    "You are a helpful assistant that plans and writes content based on the "
-                    "user's topic. Chat history is provided via {chat_history} (it may be empty). "
-                    "Use it when helpful to stay consistent across turns.",
-                ),
-                (
-                    "user",
-                    f"The topic is {{topic}}. Make sure you find any interesting and "
-                    f"relevant information given the current year is {datetime.now().year}.",
-                ),
-            ]
-        )
+    # ------------------------------------------------------------------
+    # LLM factory — MUST NOT be modified (DataRobot requirement)
+    # ------------------------------------------------------------------
 
     def llm(
         self,
@@ -155,49 +209,455 @@ class MyAgent(LangGraphAgent):
 
         return ChatLiteLLM(**config)
 
+    # ------------------------------------------------------------------
+    # Prompt template
+    # ------------------------------------------------------------------
+
     @property
-    def agent_planner(self) -> Any:
+    def prompt_template(self) -> ChatPromptTemplate:
+        return ChatPromptTemplate.from_messages(
+            [
+                (
+                    "system",
+                    "You are an expert AI Travel Planner. Help the user plan their perfect trip.",
+                ),
+                ("user", "{user_prompt_content}"),
+            ]
+        )
+
+    def convert_input_message(self, run_agent_input: RunAgentInput) -> Command:
+        """Convert the full AG-UI message history into LangGraph state messages.
+
+        Converts every prior turn in run_agent_input.messages into the
+        appropriate HumanMessage / AIMessage so that _intake_node sees the
+        complete conversation history, not just the latest user turn.
+        """
+        history_messages: list[Any] = []
+        all_messages = list(run_agent_input.messages or [])
+
+        # Prior messages become raw history entries.
+        # The last user message is formatted through the prompt template so
+        # the system prompt is included.
+        prior_messages = all_messages[:-1] if len(all_messages) > 1 else []
+
+        for msg in prior_messages:
+            role = getattr(msg, "role", None)
+            content = getattr(msg, "content", "") or ""
+            if role == "user":
+                history_messages.append(HumanMessage(content=str(content)))
+            elif role == "assistant":
+                history_messages.append(AIMessage(content=str(content)))
+
+        raw = extract_user_prompt_content(run_agent_input)
+        user_prompt_str = raw if isinstance(raw, str) else str(raw)
+        current_messages = self.prompt_template.invoke(
+            {"user_prompt_content": user_prompt_str}
+        ).to_messages()
+
+        return Command(update={"messages": history_messages + current_messages})  # type: ignore[return-value]
+
+    # ------------------------------------------------------------------
+    # Node: intake_node
+    # Extracts structured trip fields from the user's latest message.
+    # ------------------------------------------------------------------
+
+
+    def _intake_node(self, state: TravelState) -> dict[str, Any]:
+        messages = state.get("messages", [])
+        print("messages", messages)
+
+        conversation_lines: list[str] = []
+        for msg in messages:
+            if isinstance(msg, HumanMessage):
+                role = "User"
+            elif isinstance(msg, AIMessage):
+                role = "Assistant"
+            else:
+                continue
+            content = msg.content if isinstance(msg.content, str) else str(msg.content)
+            conversation_lines.append(f"{role}: {content}")
+
+        conversation_context = "\n".join(conversation_lines) if conversation_lines else "(no conversation yet)"
+
+        extraction_prompt = (
+            "You are a travel intake assistant. Extract ALL travel details mentioned ANYWHERE "
+            "in the conversation history below — not just the latest message.\n\n"
+            "CRITICAL RULES:\n"
+            "- Read every User message from top to bottom before deciding what is known.\n"
+            "- A field is 'known' if it was mentioned in ANY prior User message.\n"
+            "- NEVER leave a field empty/zero if it was mentioned in an earlier turn.\n"
+            "- For example, if the user said 'Greece' in one message and 'next week' in another, "
+            "both destination=Greece and travel_dates=next week must be set.\n\n"
+            f"Full conversation history:\n{conversation_context}\n\n"
+            "Now extract all fields. Required fields are: destination, origin, num_days (or "
+            "travel_dates), budget_usd. If any required field is still missing after reading the "
+            "entire conversation, set needs_clarification=True and ask for ONLY the single most "
+            "critical missing field. Do not ask for multiple things at once."
+        )
+
+        structured_llm = self.llm().with_structured_output(TripIntakeModel)
+        extracted: TripIntakeModel = structured_llm.invoke(extraction_prompt)
+
+        return {
+            "destination": extracted.destination,
+            "origin": extracted.origin,
+            "travel_dates": extracted.travel_dates,
+            "num_days": extracted.num_days,
+            "budget_usd": extracted.budget_usd,
+            "travel_style": extracted.travel_style,
+            "currency": extracted.currency or "USD",
+            "needs_clarification": extracted.needs_clarification,
+            "clarification_question": extracted.clarification_question,
+            "research_results": state.get("research_results", {}),
+            "budget_results": state.get("budget_results", {}),
+            "itinerary": state.get("itinerary", {}),
+            "completed_steps": state.get("completed_steps", []),
+            "next_agent": state.get("next_agent", "research"),
+        }
+
+    # ------------------------------------------------------------------
+    # Node: clarify_node
+    # Runs a streaming clarify_agent so the base-class streaming layer
+    # emits proper TEXT_MESSAGE_* events to the frontend, then resets
+    # the clarification flag before the graph terminates.
+    # ------------------------------------------------------------------
+
+    @property
+    def _clarify_agent(self) -> Any:
+        """Single-shot clarification agent — no tools, streams its response naturally."""
         return create_agent(
             self.llm(),
-            tools=self.mcp_tools + self._workflow_tools,
+            tools=[],
             system_prompt=make_system_prompt(
-                "You are a content planner. You create brief, structured outlines for blog articles. "
-                "You identify the most important points and cite relevant sources. Keep it simple and to the point - "
-                "this is just an outline for the writer.\n"
+                "You are a friendly AI travel planner having a warm conversation with a potential traveller. "
+                "When asked to clarify a missing detail, write a single short, encouraging, conversational "
+                "message. Never list multiple questions. Never output JSON or structured data."
+            ),
+            name="clarify_agent",
+        )
+
+    def _clarify_node(self, state: TravelState) -> dict[str, Any]:
+        """Stream a warm clarification question via the clarify_agent so that the
+        base-class streaming infrastructure picks up the AIMessageChunk events
+        and the frontend receives a proper TEXT_MESSAGE_* sequence.
+        """
+        raw_question = state.get("clarification_question", "")
+        already_know = {
+            k: v for k, v in {
+                "destination": state.get("destination", ""),
+                "origin": state.get("origin", ""),
+                "travel_dates": state.get("travel_dates", ""),
+                "num_days": state.get("num_days", 0),
+                "budget_usd": state.get("budget_usd", 0.0),
+                "travel_style": state.get("travel_style", ""),
+            }.items() if v and v not in ("", 0, 0.0)
+        }
+
+        prompt_text = (
+            f"So far you know about the user's trip: {already_know if already_know else 'nothing yet'}.\n"
+            f"Please ask the user (in a friendly, natural way): {raw_question}"
+        )
+
+        result = self._clarify_agent.invoke({"messages": [HumanMessage(content=prompt_text)]})
+        friendly_question = _last_ai_content(result)
+
+        return {
+            "needs_clarification": False,
+            "clarification_question": "",
+            "messages": [AIMessage(content=friendly_question)],
+        }
+
+    # ------------------------------------------------------------------
+    # Node: supervisor_node
+    # Reads completed_steps and state to decide which sub-agent runs next.
+    # ------------------------------------------------------------------
+
+    def _supervisor_node(self, state: TravelState) -> dict[str, Any]:
+        """Orchestrate sub-agent execution order using deterministic rule-based routing.
+
+        Reads completed_steps and result buckets to decide which specialist runs
+        next. Fully rule-based to avoid any risk of LLM-driven infinite loops.
+        """
+        completed = state.get("completed_steps", [])
+        research_done = bool(state.get("research_results"))
+        budget_done = bool(state.get("budget_results"))
+        itinerary_done = bool(state.get("itinerary"))
+
+        # Rule-based fast path avoids an LLM call when the order is clear
+        if not research_done:
+            next_agent = "research"
+            reasoning = "Research must run first to gather destination info, weather, and flights."
+        elif not budget_done:
+            next_agent = "budget"
+            reasoning = "Budget analysis runs after research to use flight costs and currency info."
+        elif not itinerary_done:
+            next_agent = "planner"
+            reasoning = "Planner builds the day-by-day itinerary using research and budget results."
+        else:
+            next_agent = "FINISH"
+            reasoning = "All sub-agents have completed. The travel plan is ready."
+
+        if self.verbose:
+            print(f"[supervisor] → {next_agent}: {reasoning}")
+
+        return {
+            "next_agent": next_agent,
+            "completed_steps": completed,
+        }
+
+    # ------------------------------------------------------------------
+    # Node factories for specialist sub-agents
+    # ------------------------------------------------------------------
+
+    @property
+    def _research_agent(self) -> Any:
+        return create_agent(
+            self.llm(),
+            tools=[get_destination_weather, get_country_info, search_flights] + self.mcp_tools + self._workflow_tools,
+            system_prompt=make_system_prompt(
+                "You are the Travel Research Agent. Your job is to gather accurate destination intelligence.\n"
                 "\n"
-                "You have access to tools that can help you research and gather information. Use these tools when "
-                "required to collect accurate and up-to-date information about the topic for your planning and research.\n"
+                "Use your tools to:\n"
+                "1. Fetch current weather for the destination (get_destination_weather)\n"
+                "2. Retrieve country facts: capital, language, currency, timezone (get_country_info)\n"
+                "3. Search for available flights from the origin to the destination (search_flights)\n"
                 "\n"
-                "Create a simple outline with:\n"
-                "1. 10-15 key points or facts (bullet points only, no paragraphs)\n"
-                "2. 2-3 relevant sources or references\n"
-                "3. A brief suggested structure (intro, 2-3 sections, conclusion)\n"
+                "Always call all three tools. Return a comprehensive JSON summary of your findings.\n"
+                "Include best flight option price so the budget agent can use it."
+            ),
+            name="research_agent",
+        )
+
+    @property
+    def _budget_agent(self) -> Any:
+        return create_agent(
+            self.llm(),
+            tools=[convert_currency, calculate_budget_breakdown] + self.mcp_tools + self._workflow_tools,
+            system_prompt=make_system_prompt(
+                "You are the Travel Budget Agent. Your job is to produce a clear financial plan for the trip.\n"
                 "\n"
-                "Do NOT write paragraphs or detailed explanations. Just provide a focused list.",
+                "Use your tools to:\n"
+                "1. Convert the total budget to the destination's local currency (convert_currency)\n"
+                "2. Build an itemised cost breakdown across flights, hotel, food, activities and transport "
+                "(calculate_budget_breakdown)\n"
+                "\n"
+                "Use the flight cost from the research results when provided. Estimate hotel at ~$100/night "
+                "and activities at 15% of total budget if not specified.\n"
+                "Return a JSON summary with converted budget and full breakdown table."
+            ),
+            name="budget_agent",
+        )
+
+    @property
+    def _planner_agent(self) -> Any:
+        return create_agent(
+            self.llm(),
+            tools=[build_itinerary, get_current_datetime, remove_pii] + self.mcp_tools + self._workflow_tools,
+            system_prompt=make_system_prompt(
+                "You are the Travel Planner Agent. Your job is to create a rich, day-by-day itinerary.\n"
+                "\n"
+                "Use your tools to:\n"
+                "1. Get the current date/time if travel dates were not specified (get_current_datetime)\n"
+                "2. Build a structured day-by-day itinerary using the destination, trip style, "
+                "research results and budget (build_itinerary)\n"
+                "3. If the user's message contained any personal data (emails, phone numbers), "
+                "clean it before including in the output (remove_pii)\n"
+                "\n"
+                "Tailor activities to the travel style (e.g. food tours for 'food lover', "
+                "museums for 'culture', hiking for 'adventure').\n"
+                "Return a beautifully structured itinerary in JSON + a friendly markdown summary."
             ),
             name="planner_agent",
         )
 
-    @property
-    def agent_writer(self) -> Any:
-        return create_agent(
-            self.llm(),
-            tools=self.mcp_tools + self._workflow_tools,
-            system_prompt=make_system_prompt(
-                "You are a content writer working with a planner colleague.\n"
-                "You write opinion pieces based on the planner's outline and context. You provide objective and "
-                "impartial insights backed by the planner's information. You acknowledge when your statements are "
-                "opinions versus objective facts.\n"
-                "\n"
-                "You have access to tools that can help you verify facts and gather additional supporting information. "
-                "Use these tools when required to ensure accuracy and find relevant details while writing.\n"
-                "\n"
-                "1. Use the content plan to craft a compelling blog post.\n"
-                "2. Structure with an engaging introduction, insightful body, and summarizing conclusion.\n"
-                "3. Sections/Subtitles are properly named in an engaging manner.\n"
-                "4. CRITICAL: Keep the total output under 500 words. Each section should have 1-2 brief paragraphs.\n"
-                "\n"
-                "Write in markdown format, ready for publication.",
-            ),
-            name="writer_agent",
+    # ------------------------------------------------------------------
+    # Sub-agent node wrappers
+    # These run the specialist react agent and store results in state.
+    # These run the specialist react agent and store results in state.
+    # ------------------------------------------------------------------
+
+    def _research_node(self, state: TravelState) -> dict[str, Any]:
+        """Run the research sub-agent and persist results into shared state."""
+        context_msg = HumanMessage(
+            content=(
+                f"Research the following trip:\n"
+                f"- Destination: {state.get('destination', 'unknown')}\n"
+                f"- Origin: {state.get('origin', 'unknown')}\n"
+                f"- Dates: {state.get('travel_dates', 'flexible')}\n"
+                f"- Style: {state.get('travel_style', 'general')}\n"
+                f"\nGather weather, country info, and flight options."
+            )
         )
+        result = self._research_agent.invoke({"messages": [context_msg]})
+        last_ai = _last_ai_content(result)
+        completed = list(state.get("completed_steps", []))
+        if "research" not in completed:
+            completed.append("research")
+        return {
+            "research_results": {"summary": last_ai},
+            "completed_steps": completed,
+        }
+
+    def _budget_node(self, state: TravelState) -> dict[str, Any]:
+        """Run the budget sub-agent and persist results into shared state."""
+        context_msg = HumanMessage(
+            content=(
+                f"Calculate the budget for this trip:\n"
+                f"- Total budget: ${state.get('budget_usd', 0)} USD\n"
+                f"- Destination currency: {state.get('currency', 'USD')}\n"
+                f"- Duration: {state.get('num_days', 1)} days\n"
+                f"- Research results: {state.get('research_results', {}).get('summary', 'N/A')}\n"
+                f"\nConvert currency and produce an itemised cost breakdown."
+            )
+        )
+        result = self._budget_agent.invoke({"messages": [context_msg]})
+        last_ai = _last_ai_content(result)
+        completed = list(state.get("completed_steps", []))
+        if "budget" not in completed:
+            completed.append("budget")
+        return {
+            "budget_results": {"summary": last_ai},
+            "completed_steps": completed,
+        }
+
+    def _planner_node(self, state: TravelState) -> dict[str, Any]:
+        """Run the planner sub-agent and persist the final itinerary into shared state."""
+        context_msg = HumanMessage(
+            content=(
+                f"Create a detailed travel itinerary:\n"
+                f"- Destination: {state.get('destination', 'unknown')}\n"
+                f"- Duration: {state.get('num_days', 1)} days\n"
+                f"- Travel style: {state.get('travel_style', 'general')}\n"
+                f"- Travel dates: {state.get('travel_dates', 'flexible')}\n"
+                f"- Research findings: {state.get('research_results', {}).get('summary', 'N/A')}\n"
+                f"- Budget plan: {state.get('budget_results', {}).get('summary', 'N/A')}\n"
+                f"\nBuild a day-by-day itinerary. Use get_current_datetime if dates are unclear."
+            )
+        )
+        result = self._planner_agent.invoke({"messages": [context_msg]})
+        last_ai = _last_ai_content(result)
+        completed = list(state.get("completed_steps", []))
+        if "planner" not in completed:
+            completed.append("planner")
+        return {
+            "itinerary": {"summary": last_ai},
+            "completed_steps": completed,
+        }
+
+    # ------------------------------------------------------------------
+    # Node: presenter_node
+    # Final node — synthesizes all sub-agent results into a single
+    # beautiful, user-facing markdown response. No tools needed.
+    # ------------------------------------------------------------------
+
+    def _presenter_node(self, state: TravelState) -> dict[str, Any]:
+        """Synthesize all collected data into a polished, user-facing travel plan.
+
+        This dedicated presenter agent reads the research, budget, and itinerary
+        results and produces a single, cohesive markdown response. It never
+        exposes raw JSON, internal state, or agent prefixes to the user.
+        """
+        destination = state.get("destination", "your destination")
+        origin = state.get("origin", "your city")
+        num_days = state.get("num_days", 0)
+        budget_usd = state.get("budget_usd", 0.0)
+        travel_style = state.get("travel_style", "general")
+        travel_dates = state.get("travel_dates", "")
+        research = state.get("research_results", {}).get("summary", "")
+        budget = state.get("budget_results", {}).get("summary", "")
+        itinerary = state.get("itinerary", {}).get("summary", "")
+
+        synthesis_prompt = (
+            f"You are a friendly, expert travel consultant presenting a complete trip plan to a client.\n"
+            f"\n"
+            f"Trip details:\n"
+            f"- Destination: {destination}\n"
+            f"- Departing from: {origin}\n"
+            f"- Duration: {num_days} days{' (' + travel_dates + ')' if travel_dates else ''}\n"
+            f"- Total budget: ${budget_usd:,.0f} USD\n"
+            f"- Travel style: {travel_style}\n"
+            f"\n"
+            f"Research findings:\n{research}\n"
+            f"\n"
+            f"Budget analysis:\n{budget}\n"
+            f"\n"
+            f"Itinerary:\n{itinerary}\n"
+            f"\n"
+            f"Write a warm, engaging, well-formatted markdown response presenting this as a complete "
+            f"travel plan. Use clear sections with headers. Do NOT expose raw JSON, internal agent "
+            f"labels, or technical details. Speak directly to the traveller in second person ('you'). "
+            f"End with 2-3 practical travel tips specific to the destination."
+        )
+
+        response = self.llm().invoke(synthesis_prompt)
+        final_text = response.content if isinstance(response.content, str) else str(response.content)
+
+        return {"messages": [AIMessage(content=final_text)]}
+
+    # ------------------------------------------------------------------
+    # Workflow graph
+    # ------------------------------------------------------------------
+
+    @property
+    def workflow(self) -> StateGraph[TravelState]:  # type: ignore[override]
+        graph: StateGraph[TravelState] = StateGraph(TravelState)
+
+        # Register nodes
+        graph.add_node("intake_node", self._intake_node)
+        graph.add_node("clarify_node", self._clarify_node)
+        graph.add_node("supervisor_node", self._supervisor_node)
+        graph.add_node("research_node", self._research_node)
+        graph.add_node("budget_node", self._budget_node)
+        graph.add_node("planner_node", self._planner_node)
+        graph.add_node("presenter_node", self._presenter_node)
+
+        # Entry point
+        graph.add_edge(START, "intake_node")
+
+        # Intake → clarify (question delivered) or supervisor (proceed to planning)
+        graph.add_conditional_edges(
+            "intake_node",
+            _route_intake,
+            {"clarify_node": "clarify_node", "supervisor_node": "supervisor_node"},
+        )
+
+        # Clarify resets flags then terminates — next user message starts a fresh run
+        # that flows through intake_node again with the accumulated state.
+        graph.add_edge("clarify_node", END)
+
+        # Supervisor → specialist or presenter (conditional)
+        graph.add_conditional_edges(
+            "supervisor_node",
+            _route_supervisor,
+            {
+                "research_node": "research_node",
+                "budget_node": "budget_node",
+                "planner_node": "planner_node",
+                "presenter_node": "presenter_node",
+            },
+        )
+
+        # All specialist nodes return to supervisor after completion
+        graph.add_edge("research_node", "supervisor_node")
+        graph.add_edge("budget_node", "supervisor_node")
+        graph.add_edge("planner_node", "supervisor_node")
+
+        # Presenter is the final node — delivers the polished response then ends
+        graph.add_edge("presenter_node", END)
+
+        return graph  # type: ignore[return-value]
+
+
+# ---------------------------------------------------------------------------
+# Helper
+# ---------------------------------------------------------------------------
+
+
+def _last_ai_content(result: Any) -> str:
+    """Extract the last AI message content from a react-agent result dict."""
+    msgs = result.get("messages", [])
+    for msg in reversed(msgs):
+        if isinstance(msg, AIMessage):
+            content = msg.content
+            return content if isinstance(content, str) else str(content)
+    return str(result)
