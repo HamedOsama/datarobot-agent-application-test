@@ -1,5 +1,6 @@
 import { v4 as uuid } from 'uuid';
 import type {
+  Message,
   ReasoningMessageChunkEvent,
   ReasoningMessageContentEvent,
   ReasoningMessageEndEvent,
@@ -13,6 +14,7 @@ import type {
 import { EventType } from '@ag-ui/core';
 import type { ChatStateEventByType } from '@/types/events';
 import { MessageResponse } from '@/api/chat/types.ts';
+import { ToolInvocationUIPart } from '@/types/message.ts';
 
 type AgUiTextEvent =
   | TextMessageStartEvent
@@ -205,6 +207,44 @@ export function messageToStateEvent(message: MessageResponse): ChatStateEventByT
     type: 'message',
     value: message,
   };
+}
+
+export function messageResponseToAgUiMessage(message: MessageResponse): Message | null {
+  const { id, role, content } = message;
+
+  if (role === 'user' || role === 'system') {
+    const textContent = content.content ?? content.parts.find(p => p.type === 'text')?.text ?? '';
+    return { id, role, content: textContent };
+  }
+
+  if (role === 'assistant') {
+    const toolInvocationParts = content.parts.filter(p => p.type === 'tool-invocation') as ToolInvocationUIPart[];
+    if (toolInvocationParts.length > 0) {
+      return {
+        id,
+        role: 'assistant',
+        toolCalls: toolInvocationParts.map(p => ({
+          id: p.toolInvocation.toolCallId ?? id,
+          type: 'function' as const,
+          function: {
+            name: p.toolInvocation.toolName,
+            arguments: typeof p.toolInvocation.args === 'string'
+              ? p.toolInvocation.args
+              : JSON.stringify(p.toolInvocation.args ?? {}),
+          },
+        })),
+      };
+    }
+    const textContent = content.content ?? content.parts.find(p => p.type === 'text')?.text ?? '';
+    return { id, role: 'assistant', content: textContent };
+  }
+
+  if (role === 'reasoning') {
+    const reasoningContent = content.content ?? '';
+    return { id, role: 'reasoning', content: reasoningContent };
+  }
+
+  return null;
 }
 
 function reasoningPart(reasoningText: string): {

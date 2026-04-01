@@ -21,6 +21,7 @@ import {
   createTextMessageFromAgUiEvent,
   createTextMessageFromUserInput,
   createToolMessageFromAgUiEvent,
+  messageResponseToAgUiMessage,
   messageToStateEvent,
 } from '@/lib/mappers';
 import { MessageResponse } from '@/api/chat/types.ts';
@@ -105,7 +106,24 @@ export function useAgUiChat({
 
   async function sendMessage(message: string) {
     const messageId = uuid();
-    agent.messages = [{ id: messageId, role: 'user', content: message }];
+
+    const historyMessages = (history ?? [])
+      .map(messageResponseToAgUiMessage)
+      .filter(m => m !== null);
+
+    const sessionMessages = events
+      .filter(e => e.type === 'message')
+      .map(e => messageResponseToAgUiMessage(e.value as MessageResponse))
+      .filter(m => m !== null);
+
+    const seenIds = new Set(historyMessages.map(m => m!.id));
+    const newSessionMessages = sessionMessages.filter(m => !seenIds.has(m!.id));
+
+    agent.messages = [
+      ...historyMessages,
+      ...newSessionMessages,
+      { id: messageId, role: 'user', content: message },
+    ];
 
     const historyMessage = createTextMessageFromUserInput({ message, chatId, messageId });
     addEvent({ type: 'message', value: historyMessage });
