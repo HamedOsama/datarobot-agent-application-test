@@ -11,27 +11,114 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Research tools: weather, country info, and flight search with real API + mock fallbacks."""
+"""Research tools: weather, country info, and flight search with real API + LLM fallbacks."""
 
+from datetime import date as _date
 import json
 import os
 from typing import Optional
 
 import requests
 from langchain_core.tools import tool
+from langchain_litellm.chat_models import ChatLiteLLM
+from pydantic import BaseModel, Field
+from agent.config import Config
+
+
+# ---------------------------------------------------------------------------
+# Structured output model for LLM-generated weather fallback
+# ---------------------------------------------------------------------------
+
+
+class _DailyWeather(BaseModel):
+    date: str = Field(description="Date in YYYY-MM-DD format.")
+    temperature_c: float = Field(description="Expected daytime temperature in Celsius.")
+    feels_like_c: float = Field(description="Feels-like temperature in Celsius.")
+    condition: str = Field(description="Short weather condition label, e.g. 'Sunny', 'Rainy'.")
+    description: str = Field(description="One-sentence weather description for the day.")
+    humidity_pct: int = Field(description="Expected relative humidity percentage (0-100).")
+    wind_kph: float = Field(description="Expected wind speed in km/h.")
+
+
+class _WeatherForecast(BaseModel):
+    summary: str = Field(
+        description=(
+            "A 3-5 sentence overview of the weather across the full date range: "
+            "dominant conditions, temperature range, any notable changes day to day, "
+            "and practical advice for the traveller (e.g. pack a rain jacket, "
+            "expect afternoon heat)."
+        )
+    )
+    forecast: list[_DailyWeather] = Field(
+        description="One entry per day covering the requested date range."
+    )
+
+
+def _llm_weather_fallback(
+    city: str,
+    country_code: Optional[str],
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+) -> dict:
+    """Ask the LLM for plausible weather data when the real API is unavailable.
+
+    Returns a dict with ``summary`` (str) and ``forecast`` (list of daily dicts).
+    """
+    cfg = Config()
+    api_base_url = os.environ.get("LITELLM_API_BASE", "")
+    api_key = os.environ.get("DATAROBOT_API_TOKEN", os.environ.get("OPENAI_API_KEY", ""))
+    model = cfg.llm_default_model
+
+    location = f"{city}, {country_code.upper()}" if country_code else city
+
+    if date_from and date_to:
+        date_context = f"from {date_from} to {date_to} (one entry per day)"
+    elif date_from:
+        date_context = f"for {date_from}"
+    else:
+        date_context = "for today"
+
+    prompt = (
+        f"Provide a plausible day-by-day weather forecast for {location} {date_context}. "
+        "Base your answer on the typical climate for that location and time of year. "
+        "Return only the structured fields with no additional commentary."
+    )
+
+    _fallback_day = {
+        "temperature_c": 22.0,
+        "feels_like_c": 21.0,
+        "condition": "Partly Cloudy",
+        "description": "partly cloudy with light breeze",
+        "humidity_pct": 52,
+        "wind_kph": 14.0,
+    }
+
+    try:
+        llm = ChatLiteLLM(
+            model=model,
+            api_base=api_base_url or None,
+            api_key=api_key or None,
+            timeout=15,
+            streaming=False,
+            max_retries=2,
+        )
+        structured_llm = llm.with_structured_output(_WeatherForecast)
+        result: _WeatherForecast = structured_llm.invoke(prompt)  # type: ignore[assignment]
+        return {
+            "summary": result.summary,
+            "forecast": [day.model_dump() for day in result.forecast],
+        }
+    except Exception:
+        date_label = date_from or "today"
+        return {
+            "summary": f"Weather information for {city} is currently unavailable.",
+            "forecast": [{**_fallback_day, "date": date_label}],
+        }
+
 
 # ---------------------------------------------------------------------------
 # Mock fallback data
 # ---------------------------------------------------------------------------
-
-_MOCK_WEATHER_BASE = {
-    "temperature_c": 22,
-    "feels_like_c": 21,
-    "condition": "Partly Cloudy",
-    "description": "partly cloudy with light breeze",
-    "humidity_pct": 52,
-    "wind_kph": 14,
-}
 
 _MOCK_COUNTRY_BASE = {
     "capital": "Rome",
@@ -107,24 +194,97 @@ def _get_amadeus_token(api_key: str, api_secret: str) -> str:
 
 
 @tool
-def get_destination_weather(city: str, country_code: Optional[str] = None) -> str:
-    """Fetch current weather for a destination city.
+def get_destination_weather(
+    city: str,
+    country_code: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+) -> str:
+    """Fetch weather for a destination city, optionally over a date range.
+
+    When a date range is provided the response contains a day-by-day forecast
+    instead of a single current-conditions snapshot.
 
     Args:
         city: City name, e.g. 'Rome' or 'Tokyo'.
         country_code: Optional ISO 3166-1 alpha-2 country code, e.g. 'IT', 'JP'.
+        date_from: Optional start date in YYYY-MM-DD format, e.g. '2025-06-10'.
+        date_to: Optional end date in YYYY-MM-DD format, e.g. '2025-06-15'.
 
     Returns:
-        JSON string with temperature, condition, humidity and wind information.
+        JSON string. With no date range: a single weather snapshot. With a date
+        range: an object with a ``summary`` (3-5 sentence overview of the period)
+        and a ``forecast`` list with one entry per day.
     """
     api_key = os.environ.get("OPENWEATHER_API_KEY", "")
+    meta = {"city": city}
+    if country_code:
+        meta["country"] = country_code.upper()
+
+    # ------------------------------------------------------------------ #
+    # No API key → LLM fallback for the full date range                   #
+    # ------------------------------------------------------------------ #
     if not api_key:
-        result = {"city": city, **_MOCK_WEATHER_BASE}
-        if country_code:
-            result["country"] = country_code.upper()
-        return json.dumps(result, indent=2)
+        llm_data = _llm_weather_fallback(city, country_code, date_from, date_to)
+        if date_from or date_to:
+            return json.dumps({**meta, "summary": llm_data["summary"], "forecast": llm_data["forecast"]}, indent=2)
+        return json.dumps({**meta, **llm_data["forecast"][0]}, indent=2)
 
     query = f"{city},{country_code}" if country_code else city
+
+    # ------------------------------------------------------------------ #
+    # Date range → OWM 5-day/3-hour forecast endpoint, filtered by dates  #
+    # ------------------------------------------------------------------ #
+    if date_from or date_to:
+        try:
+            resp = requests.get(
+                "https://api.openweathermap.org/data/2.5/forecast",
+                params={"q": query, "appid": api_key, "units": "metric", "cnt": 40},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            raw_list = resp.json().get("list", [])
+
+            start = _date.fromisoformat(date_from) if date_from else None
+            end = _date.fromisoformat(date_to) if date_to else None
+
+            # Collapse 3-hour slots into one representative entry per day
+            # (pick the midday slot closest to 12:00 for each day).
+            by_day: dict[str, list[dict]] = {}
+            for slot in raw_list:
+                slot_date = slot["dt_txt"].split(" ")[0]
+                by_day.setdefault(slot_date, []).append(slot)
+
+            forecast = []
+            for day_str, slots in sorted(by_day.items()):
+                day = _date.fromisoformat(day_str)
+                if start and day < start:
+                    continue
+                if end and day > end:
+                    continue
+                # prefer the slot nearest to noon
+                best = min(slots, key=lambda s: abs(int(s["dt_txt"].split(" ")[1][:2]) - 12))
+                forecast.append({
+                    "date": day_str,
+                    "temperature_c": best["main"]["temp"],
+                    "feels_like_c": best["main"]["feels_like"],
+                    "condition": best["weather"][0]["main"],
+                    "description": best["weather"][0]["description"],
+                    "humidity_pct": best["main"]["humidity"],
+                    "wind_kph": round(best["wind"]["speed"] * 3.6, 1),
+                })
+
+            if forecast:
+                return json.dumps({**meta, "forecast": forecast}, indent=2)
+            # OWM free tier only covers ~5 days; fall back to LLM for longer ranges
+            raise ValueError("no matching forecast slots")
+        except Exception:
+            llm_data = _llm_weather_fallback(city, country_code, date_from, date_to)
+            return json.dumps({**meta, "summary": llm_data["summary"], "forecast": llm_data["forecast"]}, indent=2)
+
+    # ------------------------------------------------------------------ #
+    # No date range → OWM current-conditions endpoint                     #
+    # ------------------------------------------------------------------ #
     try:
         resp = requests.get(
             "https://api.openweathermap.org/data/2.5/weather",
@@ -145,10 +305,8 @@ def get_destination_weather(city: str, country_code: Optional[str] = None) -> st
         }
         return json.dumps(result, indent=2)
     except Exception:
-        result = {"city": city, **_MOCK_WEATHER_BASE}
-        if country_code:
-            result["country"] = country_code.upper()
-        return json.dumps(result, indent=2)
+        llm_data = _llm_weather_fallback(city, country_code, date_from, date_to)
+        return json.dumps({**meta, **llm_data["forecast"][0]}, indent=2)
 
 
 @tool
