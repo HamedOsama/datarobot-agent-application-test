@@ -22,7 +22,7 @@ Multi-agent LangGraph workflow with:
   - planner_node     : itinerary builder, datetime, PII remover
 """
 # ruff: noqa: I001
-
+from datetime import datetime
 from typing import Any, Literal, Optional, Union
 
 from ag_ui.core import RunAgentInput
@@ -56,8 +56,9 @@ class TravelState(MessagesState):
     # Extracted trip parameters
     destination: str
     origin: str
-    travel_dates: str
-    num_days: int
+    departure_date: str   # ISO date or human-readable, e.g. "2025-06-10"
+    return_date: str      # ISO date or human-readable, e.g. "2025-06-15"
+    num_days: int         # Computed from departure_date → return_date
     budget_usd: float
     travel_style: str
     currency: str
@@ -91,13 +92,13 @@ class TripIntakeModel(BaseModel):
 
     destination: str = Field(description="Travel destination extracted from the message, e.g. 'Rome, Italy'. Use empty string '' if not mentioned.")
     origin: str = Field(description="Departure city or airport, e.g. 'London'. Use empty string '' if not mentioned.")
-    travel_dates: str = Field(description="Travel dates or duration, e.g. 'June 10-15 2025' or '5 days'. Use empty string '' if not mentioned.")
-    num_days: int = Field(description="Number of travel days as integer, e.g. 5. Use 0 if not mentioned.")
+    departure_date: str = Field(description="The date the user will depart / start travelling. ALWAYS resolve to ISO format YYYY-MM-DD, e.g. '2025-06-10'. Resolve relative expressions like 'next Monday' or '7th April' using today's date provided in the prompt. Use empty string '' if not mentioned.")
+    return_date: str = Field(description="The date the user will return / arrive back home. ALWAYS resolve to ISO format YYYY-MM-DD, e.g. '2025-06-15'. Resolve relative expressions like 'next Friday' or 'in 2 weeks' using today's date provided in the prompt. Use empty string '' if not mentioned.")
     budget_usd: float = Field(description="Total trip budget converted to USD as a float, e.g. 1200.0. Use 0.0 if not mentioned.")
     travel_style: str = Field(description="Travel preferences, e.g. 'culture, food, adventure, relaxation'. Use empty string '' if not mentioned.")
     currency: str = Field(description="Preferred local currency code ISO 4217, e.g. 'EUR'. Use 'USD' if not mentioned.")
-    needs_clarification: bool = Field(description="Set to true if any of these required fields are still empty/zero after extraction: destination, origin, num_days, budget_usd.")
-    clarification_question: str = Field(description="A single friendly question asking for only the most critical missing field. Use empty string '' if needs_clarification is false.")
+    needs_clarification: bool = Field(description="Set to true if any of these required fields are still empty/zero after extraction: destination, origin, departure_date, return_date, budget_usd.")
+    clarification_question: str = Field(description="A single friendly question asking for only the single most critical missing field. Ask for departure_date before return_date. Use empty string '' if needs_clarification is false.")
 
 
 # ---------------------------------------------------------------------------
@@ -266,6 +267,10 @@ class MyAgent(LangGraphAgent):
         messages = state.get("messages", [])
         print("messages", messages)
 
+        today = datetime.now()
+        today_str = today.strftime("%Y-%m-%d")
+        today_weekday = today.strftime("%A")  # e.g. "Monday"
+
         conversation_lines: list[str] = []
         for msg in messages:
             if isinstance(msg, HumanMessage):
@@ -280,29 +285,40 @@ class MyAgent(LangGraphAgent):
         conversation_context = "\n".join(conversation_lines) if conversation_lines else "(no conversation yet)"
 
         extraction_prompt = (
+            f"Today's date is {today_str} ({today_weekday}). Use this to resolve any relative "
+            f"date references such as 'next Monday', 'this Friday', '7th April', 'in 2 weeks', etc.\n\n"
             "You are a travel intake assistant. Extract ALL travel details mentioned ANYWHERE "
             "in the conversation history below — not just the latest message.\n\n"
             "CRITICAL RULES:\n"
             "- Read every User message from top to bottom before deciding what is known.\n"
             "- A field is 'known' if it was mentioned in ANY prior User message.\n"
             "- NEVER leave a field empty/zero if it was mentioned in an earlier turn.\n"
-            "- For example, if the user said 'Greece' in one message and 'next week' in another, "
-            "both destination=Greece and travel_dates=next week must be set.\n\n"
+            "- Extract BOTH the departure date (when the user leaves) and the return date "
+            "(when the user comes back). These are separate fields.\n"
+            "- Always resolve dates to the ISO format YYYY-MM-DD (e.g. '2025-06-10'). "
+            "Use today's date above as the reference point for all relative expressions.\n"
+            "- For example, if the user said 'I leave on June 10 and return on June 15', "
+            "set departure_date='2025-06-10' and return_date='2025-06-15'.\n\n"
             f"Full conversation history:\n{conversation_context}\n\n"
-            "Now extract all fields. Required fields are: destination, origin, num_days (or "
-            "travel_dates), budget_usd. If any required field is still missing after reading the "
+            "Now extract all fields. Required fields are: destination, origin, departure_date, "
+            "return_date, budget_usd. If any required field is still missing after reading the "
             "entire conversation, set needs_clarification=True and ask for ONLY the single most "
-            "critical missing field. Do not ask for multiple things at once."
+            "critical missing field (ask for departure_date before return_date). "
+            "Do not ask for multiple things at once."
         )
 
         structured_llm = self.llm().with_structured_output(TripIntakeModel)
         extracted: TripIntakeModel = structured_llm.invoke(extraction_prompt)
 
+        # Compute num_days from the two explicit dates when possible
+        num_days = _compute_num_days(extracted.departure_date, extracted.return_date)
+
         return {
             "destination": extracted.destination,
             "origin": extracted.origin,
-            "travel_dates": extracted.travel_dates,
-            "num_days": extracted.num_days,
+            "departure_date": extracted.departure_date,
+            "return_date": extracted.return_date,
+            "num_days": num_days,
             "budget_usd": extracted.budget_usd,
             "travel_style": extracted.travel_style,
             "currency": extracted.currency or "USD",
@@ -346,8 +362,8 @@ class MyAgent(LangGraphAgent):
             k: v for k, v in {
                 "destination": state.get("destination", ""),
                 "origin": state.get("origin", ""),
-                "travel_dates": state.get("travel_dates", ""),
-                "num_days": state.get("num_days", 0),
+                "departure_date": state.get("departure_date", ""),
+                "return_date": state.get("return_date", ""),
                 "budget_usd": state.get("budget_usd", 0.0),
                 "travel_style": state.get("travel_style", ""),
             }.items() if v and v not in ("", 0, 0.0)
@@ -483,9 +499,12 @@ class MyAgent(LangGraphAgent):
                 f"Research the following trip:\n"
                 f"- Destination: {state.get('destination', 'unknown')}\n"
                 f"- Origin: {state.get('origin', 'unknown')}\n"
-                f"- Dates: {state.get('travel_dates', 'flexible')}\n"
+                f"- Departure date: {state.get('departure_date', 'flexible')}\n"
+                f"- Return date: {state.get('return_date', 'flexible')}\n"
+                f"- Duration: {state.get('num_days', 1)} days\n"
                 f"- Style: {state.get('travel_style', 'general')}\n"
-                f"\nGather weather, country info, and flight options."
+                f"\nGather weather, country info, and flight options. "
+                f"Use the exact departure and return dates when searching for flights."
             )
         )
         result = self._research_agent.invoke({"messages": [context_msg]})
@@ -526,12 +545,14 @@ class MyAgent(LangGraphAgent):
             content=(
                 f"Create a detailed travel itinerary:\n"
                 f"- Destination: {state.get('destination', 'unknown')}\n"
+                f"- Departure date: {state.get('departure_date', 'flexible')}\n"
+                f"- Return date: {state.get('return_date', 'flexible')}\n"
                 f"- Duration: {state.get('num_days', 1)} days\n"
                 f"- Travel style: {state.get('travel_style', 'general')}\n"
-                f"- Travel dates: {state.get('travel_dates', 'flexible')}\n"
                 f"- Research findings: {state.get('research_results', {}).get('summary', 'N/A')}\n"
                 f"- Budget plan: {state.get('budget_results', {}).get('summary', 'N/A')}\n"
-                f"\nBuild a day-by-day itinerary. Use get_current_datetime if dates are unclear."
+                f"\nBuild a day-by-day itinerary anchored to the departure and return dates. "
+                f"Use get_current_datetime only if dates are unclear."
             )
         )
         result = self._planner_agent.invoke({"messages": [context_msg]})
@@ -559,13 +580,20 @@ class MyAgent(LangGraphAgent):
         """
         destination = state.get("destination", "your destination")
         origin = state.get("origin", "your city")
+        departure_date = state.get("departure_date", "")
+        return_date = state.get("return_date", "")
         num_days = state.get("num_days", 0)
         budget_usd = state.get("budget_usd", 0.0)
         travel_style = state.get("travel_style", "general")
-        travel_dates = state.get("travel_dates", "")
         research = state.get("research_results", {}).get("summary", "")
         budget = state.get("budget_results", {}).get("summary", "")
         itinerary = state.get("itinerary", {}).get("summary", "")
+
+        date_range = ""
+        if departure_date and return_date:
+            date_range = f"{departure_date} → {return_date}"
+        elif departure_date:
+            date_range = f"from {departure_date}"
 
         synthesis_prompt = (
             f"You are a friendly, expert travel consultant presenting a complete trip plan to a client.\n"
@@ -573,7 +601,7 @@ class MyAgent(LangGraphAgent):
             f"Trip details:\n"
             f"- Destination: {destination}\n"
             f"- Departing from: {origin}\n"
-            f"- Duration: {num_days} days{' (' + travel_dates + ')' if travel_dates else ''}\n"
+            f"- Travel dates: {date_range if date_range else 'flexible'} ({num_days} days)\n"
             f"- Total budget: ${budget_usd:,.0f} USD\n"
             f"- Travel style: {travel_style}\n"
             f"\n"
@@ -649,7 +677,7 @@ class MyAgent(LangGraphAgent):
 
 
 # ---------------------------------------------------------------------------
-# Helper
+# Helpers
 # ---------------------------------------------------------------------------
 
 
@@ -661,3 +689,44 @@ def _last_ai_content(result: Any) -> str:
             content = msg.content
             return content if isinstance(content, str) else str(content)
     return str(result)
+
+
+def _compute_num_days(departure_date: str, return_date: str) -> int:
+    """Return the number of trip days derived from departure and return dates.
+
+    Tries several common date formats. Falls back to 0 when parsing fails so
+    the supervisor can still ask for clarification.
+    """
+    if not departure_date or not return_date:
+        return 0
+
+    formats = [
+        "%Y-%m-%d",
+        "%B %d %Y",
+        "%b %d %Y",
+        "%B %d, %Y",
+        "%b %d, %Y",
+        "%d/%m/%Y",
+        "%m/%d/%Y",
+        "%d-%m-%Y",
+    ]
+
+    dep_dt = ret_dt = None
+    for fmt in formats:
+        try:
+            dep_dt = datetime.strptime(departure_date.strip(), fmt)
+            break
+        except ValueError:
+            continue
+
+    for fmt in formats:
+        try:
+            ret_dt = datetime.strptime(return_date.strip(), fmt)
+            break
+        except ValueError:
+            continue
+
+    if dep_dt and ret_dt and ret_dt > dep_dt:
+        return (ret_dt - dep_dt).days
+
+    return 0
