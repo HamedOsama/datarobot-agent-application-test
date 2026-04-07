@@ -71,6 +71,7 @@ class TravelState(MessagesState):
     # Workflow control
     needs_clarification: bool
     clarification_question: str
+    needs_confirmation: Optional[bool]  # None=not shown yet, True=waiting, False=confirmed
     next_agent: str  # "research" | "budget" | "planner" | "FINISH"
     completed_steps: list[str]
 
@@ -99,6 +100,8 @@ class TripIntakeModel(BaseModel):
     currency: str = Field(description="Preferred local currency code ISO 4217, e.g. 'EUR'. Use 'USD' if not mentioned.")
     needs_clarification: bool = Field(description="Set to true if any of these required fields are still empty/zero after extraction: destination, origin, departure_date, return_date, budget_usd.")
     clarification_question: str = Field(description="A single friendly question asking for only the single most critical missing field. Ask for departure_date before return_date. Use empty string '' if needs_clarification is false.")
+    confirmation_was_shown: bool = Field(description="Set to true if the conversation history contains an Assistant message that presented a structured trip summary and explicitly asked the user to confirm or correct the details (e.g. 'does everything look correct?', 'please confirm', 'reply to proceed'). Set to false if no such confirmation prompt appears in the history.")
+    user_confirmed: bool = Field(description="Only relevant when confirmation_was_shown is true. Set to true if the user's most recent message expresses agreement or approval of the trip details shown (e.g. 'yes', 'looks good', 'it\\'s great', 'I\\'m good with these', 'let\\'s go', 'all correct', 'sure', 'proceed'). Set to false if the user is requesting a change, expressing doubt, or if confirmation_was_shown is false.")
 
 
 # ---------------------------------------------------------------------------
@@ -106,9 +109,23 @@ class TripIntakeModel(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-def _route_intake(state: TravelState) -> Literal["clarify_node", "supervisor_node"]:
+def _route_intake(
+    state: TravelState,
+) -> Literal["clarify_node", "confirm_node", "supervisor_node"]:
     if state.get("needs_clarification", False):
         return "clarify_node"
+    # needs_confirmation=False means the user explicitly confirmed → skip confirmation
+    if state.get("needs_confirmation") is False:
+        return "supervisor_node"
+    return "confirm_node"
+
+
+def _route_confirm(state: TravelState) -> Literal["supervisor_node", "__end__"]:
+    """After confirm_node: proceed to supervisor if confirmed, otherwise stop and wait."""
+    if state.get("needs_confirmation", True):
+        # Still waiting for the user's yes/no — graph ends so the next user
+        # message (with their answer) re-enters through intake_node.
+        return "__end__"
     return "supervisor_node"
 
 
@@ -289,7 +306,7 @@ class MyAgent(LangGraphAgent):
             f"date references such as 'next Monday', 'this Friday', '7th April', 'in 2 weeks', etc.\n\n"
             "You are a travel intake assistant. Extract ALL travel details mentioned ANYWHERE "
             "in the conversation history below — not just the latest message.\n\n"
-            "CRITICAL RULES:\n"
+            "CRITICAL RULES FOR FIELD EXTRACTION:\n"
             "- Read every User message from top to bottom before deciding what is known.\n"
             "- A field is 'known' if it was mentioned in ANY prior User message.\n"
             "- NEVER leave a field empty/zero if it was mentioned in an earlier turn.\n"
@@ -299,6 +316,17 @@ class MyAgent(LangGraphAgent):
             "Use today's date above as the reference point for all relative expressions.\n"
             "- For example, if the user said 'I leave on June 10 and return on June 15', "
             "set departure_date='2025-06-10' and return_date='2025-06-15'.\n\n"
+            "CRITICAL RULES FOR CONFIRMATION DETECTION:\n"
+            "- Set confirmation_was_shown=true ONLY if the conversation contains an Assistant "
+            "message that presented the trip details as a structured summary AND explicitly asked "
+            "the user to confirm (e.g. 'does everything look correct?', 'please confirm', "
+            "'reply with yes', 'let me know what to change').\n"
+            "- Set user_confirmed=true ONLY when confirmation_was_shown=true AND the user's "
+            "most recent message  expresses acceptance — this includes ANY positive or agreeable "
+            "reply such as: 'yes', 'sure', 'ok', 'great', 'it\\'s cool', 'it\\'s very great', "
+            "'I\\'m good with these', 'all correct', 'let\\'s go', 'proceed', 'sounds good', "
+            "or any similar expression of approval. "
+            "Set user_confirmed=false if the user is asking for a change or expressing doubt.\n\n"
             f"Full conversation history:\n{conversation_context}\n\n"
             "Now extract all fields. Required fields are: destination, origin, departure_date, "
             "return_date, budget_usd. If any required field is still missing after reading the "
@@ -313,6 +341,17 @@ class MyAgent(LangGraphAgent):
         # Compute num_days from the two explicit dates when possible
         num_days = _compute_num_days(extracted.departure_date, extracted.return_date)
 
+        # The LLM already determined from the full conversation history whether:
+        #   - a confirmation prompt was previously shown (extracted.confirmation_was_shown)
+        #   - the user's latest reply is an approval    (extracted.user_confirmed)
+        # Use those two flags directly — no state persistence or keyword matching needed.
+        if extracted.confirmation_was_shown and extracted.user_confirmed:
+            needs_confirmation: Optional[bool] = False  # _route_intake → supervisor_node
+        else:
+            needs_confirmation = None  # _route_intake → confirm_node (show/re-show summary)
+
+        print(f"[intake] confirmation_was_shown={extracted.confirmation_was_shown}, user_confirmed={extracted.user_confirmed} → needs_confirmation={needs_confirmation}")
+
         return {
             "destination": extracted.destination,
             "origin": extracted.origin,
@@ -324,6 +363,7 @@ class MyAgent(LangGraphAgent):
             "currency": extracted.currency or "USD",
             "needs_clarification": extracted.needs_clarification,
             "clarification_question": extracted.clarification_question,
+            "needs_confirmation": needs_confirmation,
             "research_results": state.get("research_results", {}),
             "budget_results": state.get("budget_results", {}),
             "itinerary": state.get("itinerary", {}),
@@ -381,6 +421,71 @@ class MyAgent(LangGraphAgent):
             "needs_clarification": False,
             "clarification_question": "",
             "messages": [AIMessage(content=friendly_question)],
+        }
+
+    # ------------------------------------------------------------------
+    # Node: confirm_node
+    # Presents the extracted trip details to the user and waits for
+    # confirmation before any expensive API calls are made.
+    # ------------------------------------------------------------------
+
+    @property
+    def _confirm_agent(self) -> Any:
+        """Confirmation agent — streams a summary of extracted trip data."""
+        return create_agent(
+            self.llm(),
+            tools=[],
+            system_prompt=make_system_prompt(
+                "You are a friendly AI travel planner assistant. "
+                "Your task is to present a clean summary of the trip details you have understood "
+                "and ask the user to confirm they are correct before you start planning. "
+                "Format the summary clearly using bullet points. "
+                "End with a short, friendly question asking the user to reply with 'yes' to confirm "
+                "or to let you know what needs to be changed. "
+                "Never output JSON or technical details."
+            ),
+            name="confirm_agent",
+        )
+
+    def _confirm_node(self, state: TravelState) -> dict[str, Any]:
+        """Present the extracted trip data and ask the user to confirm before
+        any expensive sub-agent API calls are triggered.
+
+        On the first pass (needs_confirmation is not yet set), this node
+        renders a human-readable summary and terminates the graph turn so
+        the user can reply.  When the user's next message indicates approval
+        (detected in intake_node via the conversation history), intake sets
+        needs_confirmation=False and the graph routes to supervisor_node.
+        """
+        destination = state.get("destination", "")
+        origin = state.get("origin", "")
+        departure_date = state.get("departure_date", "")
+        return_date = state.get("return_date", "")
+        num_days = state.get("num_days", 0)
+        budget_usd = state.get("budget_usd", 0.0)
+        travel_style = state.get("travel_style", "not specified")
+        currency = state.get("currency", "USD")
+
+        summary_prompt = (
+            "Please confirm the following trip details with the user:\n\n"
+            f"- **Destination**: {destination}\n"
+            f"- **Departing from**: {origin}\n"
+            f"- **Departure date**: {departure_date}\n"
+            f"- **Return date**: {return_date}\n"
+            f"- **Duration**: {num_days} days\n"
+            f"- **Total budget**: ${budget_usd:,.0f} USD\n"
+            f"- **Preferred currency**: {currency}\n"
+            f"- **Travel style**: {travel_style}\n\n"
+            "Present these details in a warm, friendly way and ask the user to confirm "
+            "everything looks correct, or to let you know what to change."
+        )
+
+        result = self._confirm_agent.invoke({"messages": [HumanMessage(content=summary_prompt)]})
+        confirmation_message = _last_ai_content(result)
+
+        return {
+            "needs_confirmation": True,  # flip to True → _route_confirm will send to END
+            "messages": [AIMessage(content=confirmation_message)],
         }
 
     # ------------------------------------------------------------------
@@ -633,6 +738,7 @@ class MyAgent(LangGraphAgent):
         # Register nodes
         graph.add_node("intake_node", self._intake_node)
         graph.add_node("clarify_node", self._clarify_node)
+        graph.add_node("confirm_node", self._confirm_node)
         graph.add_node("supervisor_node", self._supervisor_node)
         graph.add_node("research_node", self._research_node)
         graph.add_node("budget_node", self._budget_node)
@@ -642,16 +748,27 @@ class MyAgent(LangGraphAgent):
         # Entry point
         graph.add_edge(START, "intake_node")
 
-        # Intake → clarify (question delivered) or supervisor (proceed to planning)
+        # Intake → clarify (missing fields) | confirm (show summary) | supervisor (confirmed)
         graph.add_conditional_edges(
             "intake_node",
             _route_intake,
-            {"clarify_node": "clarify_node", "supervisor_node": "supervisor_node"},
+            {
+                "clarify_node": "clarify_node",
+                "confirm_node": "confirm_node",
+                "supervisor_node": "supervisor_node",
+            },
         )
 
         # Clarify resets flags then terminates — next user message starts a fresh run
         # that flows through intake_node again with the accumulated state.
         graph.add_edge("clarify_node", END)
+
+        # Confirm presents the trip summary and waits — next turn re-enters via intake_node
+        graph.add_conditional_edges(
+            "confirm_node",
+            _route_confirm,
+            {"supervisor_node": "supervisor_node", "__end__": END},
+        )
 
         # Supervisor → specialist or presenter (conditional)
         graph.add_conditional_edges(
