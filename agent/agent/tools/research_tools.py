@@ -13,17 +13,17 @@
 # limitations under the License.
 """Research tools: weather, country info, and flight search with real API + LLM fallbacks."""
 
-from datetime import date as _date
 import json
 import os
+from datetime import date as _date
 from typing import Optional
 
 import requests
 from langchain_core.tools import tool
 from langchain_litellm.chat_models import ChatLiteLLM
 from pydantic import BaseModel, Field
-from agent.config import Config
 
+from agent.config import Config
 
 # ---------------------------------------------------------------------------
 # Structured output model for LLM-generated weather fallback
@@ -34,9 +34,15 @@ class _DailyWeather(BaseModel):
     date: str = Field(description="Date in YYYY-MM-DD format.")
     temperature_c: float = Field(description="Expected daytime temperature in Celsius.")
     feels_like_c: float = Field(description="Feels-like temperature in Celsius.")
-    condition: str = Field(description="Short weather condition label, e.g. 'Sunny', 'Rainy'.")
-    description: str = Field(description="One-sentence weather description for the day.")
-    humidity_pct: int = Field(description="Expected relative humidity percentage (0-100).")
+    condition: str = Field(
+        description="Short weather condition label, e.g. 'Sunny', 'Rainy'."
+    )
+    description: str = Field(
+        description="One-sentence weather description for the day."
+    )
+    humidity_pct: int = Field(
+        description="Expected relative humidity percentage (0-100)."
+    )
     wind_kph: float = Field(description="Expected wind speed in km/h.")
 
 
@@ -66,7 +72,9 @@ def _llm_weather_fallback(
     """
     cfg = Config()
     api_base_url = os.environ.get("LITELLM_API_BASE", "")
-    api_key = os.environ.get("DATAROBOT_API_TOKEN", os.environ.get("OPENAI_API_KEY", ""))
+    api_key = os.environ.get(
+        "DATAROBOT_API_TOKEN", os.environ.get("OPENAI_API_KEY", "")
+    )
     model = cfg.llm_default_model
 
     location = f"{city}, {country_code.upper()}" if country_code else city
@@ -227,7 +235,14 @@ def get_destination_weather(
     if not api_key:
         llm_data = _llm_weather_fallback(city, country_code, date_from, date_to)
         if date_from or date_to:
-            return json.dumps({**meta, "summary": llm_data["summary"], "forecast": llm_data["forecast"]}, indent=2)
+            return json.dumps(
+                {
+                    **meta,
+                    "summary": llm_data["summary"],
+                    "forecast": llm_data["forecast"],
+                },
+                indent=2,
+            )
         return json.dumps({**meta, **llm_data["forecast"][0]}, indent=2)
 
     query = f"{city},{country_code}" if country_code else city
@@ -263,16 +278,20 @@ def get_destination_weather(
                 if end and day > end:
                     continue
                 # prefer the slot nearest to noon
-                best = min(slots, key=lambda s: abs(int(s["dt_txt"].split(" ")[1][:2]) - 12))
-                forecast.append({
-                    "date": day_str,
-                    "temperature_c": best["main"]["temp"],
-                    "feels_like_c": best["main"]["feels_like"],
-                    "condition": best["weather"][0]["main"],
-                    "description": best["weather"][0]["description"],
-                    "humidity_pct": best["main"]["humidity"],
-                    "wind_kph": round(best["wind"]["speed"] * 3.6, 1),
-                })
+                best = min(
+                    slots, key=lambda s: abs(int(s["dt_txt"].split(" ")[1][:2]) - 12)
+                )
+                forecast.append(
+                    {
+                        "date": day_str,
+                        "temperature_c": best["main"]["temp"],
+                        "feels_like_c": best["main"]["feels_like"],
+                        "condition": best["weather"][0]["main"],
+                        "description": best["weather"][0]["description"],
+                        "humidity_pct": best["main"]["humidity"],
+                        "wind_kph": round(best["wind"]["speed"] * 3.6, 1),
+                    }
+                )
 
             if forecast:
                 return json.dumps({**meta, "forecast": forecast}, indent=2)
@@ -280,7 +299,14 @@ def get_destination_weather(
             raise ValueError("no matching forecast slots")
         except Exception:
             llm_data = _llm_weather_fallback(city, country_code, date_from, date_to)
-            return json.dumps({**meta, "summary": llm_data["summary"], "forecast": llm_data["forecast"]}, indent=2)
+            return json.dumps(
+                {
+                    **meta,
+                    "summary": llm_data["summary"],
+                    "forecast": llm_data["forecast"],
+                },
+                indent=2,
+            )
 
     # ------------------------------------------------------------------ #
     # No date range → OWM current-conditions endpoint                     #
