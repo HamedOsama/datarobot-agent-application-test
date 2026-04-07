@@ -75,6 +75,10 @@ class TravelState(MessagesState):
     next_agent: str  # "research" | "budget" | "planner" | "FINISH"
     completed_steps: list[str]
 
+    # Guardrail control — set by _guardrail_node, consumed by _rejection_node
+    guardrail_blocked: bool      # True when input failed safety/topic check
+    guardrail_rejection: str     # Friendly rejection text to stream to the user
+
 
 # ---------------------------------------------------------------------------
 # Pydantic model for structured intake extraction
@@ -105,8 +109,46 @@ class TripIntakeModel(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Pydantic model for LLM-based input guardrails
+# ---------------------------------------------------------------------------
+
+
+class GuardrailResult(BaseModel):
+    """Result of LLM-based input guardrail classification."""
+
+    is_travel_related: bool = Field(
+        description=(
+            "True if the user message is related to travel planning, trip enquiries, "
+            "destinations, flights, hotels, budgets, itineraries, or general follow-up "
+            "questions within an ongoing travel-planning conversation. "
+            "Set to false only when the message is entirely unrelated to travel."
+        )
+    )
+    is_safe: bool = Field(
+        description=(
+            "True if the message contains no harmful, illegal, abusive, violent, "
+            "sexually explicit, or otherwise inappropriate content. False otherwise."
+        )
+    )
+    rejection_reason: str = Field(
+        description=(
+            "A short, friendly explanation addressed to the user explaining why the "
+            "request cannot be fulfilled. Use empty string '' when is_travel_related "
+            "and is_safe are both true."
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
 # Conditional edge routing functions
 # ---------------------------------------------------------------------------
+
+
+def _route_guardrail(state: TravelState) -> Literal["rejection_node", "intake_node"]:
+    """After guardrail_node: route to rejection_node when blocked, intake_node otherwise."""
+    if state.get("guardrail_blocked", False):
+        return "rejection_node"
+    return "intake_node"
 
 
 def _route_intake(
@@ -273,6 +315,102 @@ class MyAgent(LangGraphAgent):
         ).to_messages()
 
         return Command(update={"messages": history_messages + current_messages})  # type: ignore[return-value]
+
+    # ------------------------------------------------------------------
+    # Node: guardrail_node
+    # LLM-based input guardrail — runs before intake to block off-topic
+    # or harmful requests before any trip processing begins.
+    # ------------------------------------------------------------------
+
+    def _guardrail_node(self, state: TravelState) -> dict[str, Any]:
+        """Classify the latest user message with an LLM before any processing.
+
+        Sets guardrail_blocked=True and stores the rejection text in
+        guardrail_rejection when the input fails either check. The actual
+        streaming of the rejection message is handled by _rejection_node so
+        that the base-class streaming layer sees real AIMessageChunk events.
+
+        Returns an empty dict (no state changes) when the message passes so
+        that the graph continues normally to intake_node.
+        """
+        messages = state.get("messages", [])
+        last_human = next(
+            (m for m in reversed(messages) if isinstance(m, HumanMessage)), None
+        )
+        if last_human is None:
+            return {"guardrail_blocked": False, "guardrail_rejection": ""}
+
+        user_text = last_human.content if isinstance(last_human.content, str) else str(last_human.content)
+
+        guardrail_llm = self.llm().with_structured_output(GuardrailResult)
+        result: GuardrailResult = guardrail_llm.invoke(
+            "You are a content moderation assistant for a travel-planning chatbot.\n\n"
+            "Evaluate the user message below on two criteria:\n"
+            "1. Is it related to travel planning (destinations, flights, hotels, budgets, "
+            "itineraries, trip styles, dates, currencies, or general follow-up questions "
+            "within an ongoing travel conversation)?\n"
+            "2. Is it free of harmful, illegal, abusive, or inappropriate content?\n\n"
+            f"User message:\n\"{user_text}\"\n\n"
+            "Respond with is_travel_related, is_safe, and rejection_reason."
+        )
+
+        if self.verbose:
+            print(
+                f"[guardrail] is_travel_related={result.is_travel_related}, "
+                f"is_safe={result.is_safe}"
+            )
+
+        if not result.is_safe or not result.is_travel_related:
+            rejection = result.rejection_reason or (
+                "I'm sorry, I can only help with travel planning requests. "
+                "Feel free to ask me about destinations, flights, hotels, or itineraries!"
+            )
+            return {"guardrail_blocked": True, "guardrail_rejection": rejection}
+
+        return {"guardrail_blocked": False, "guardrail_rejection": ""}
+
+    # ------------------------------------------------------------------
+    # Node: rejection_node
+    # Streams the guardrail rejection through a real LLM call so the
+    # base-class streaming layer emits proper TEXT_MESSAGE_* events.
+    # ------------------------------------------------------------------
+
+    @property
+    def _rejection_agent(self) -> Any:
+        """Single-shot agent that re-states a guardrail rejection naturally."""
+        return create_agent(
+            self.llm(),
+            tools=[],
+            system_prompt=make_system_prompt(
+                "You are a friendly AI travel planner assistant. "
+                "When a user's request falls outside your travel-planning scope or contains "
+                "inappropriate content, politely decline and invite them to ask about travel instead. "
+                "Keep your response brief, warm, and non-judgmental. "
+                "Never output JSON or structured data."
+            ),
+            name="rejection_agent",
+        )
+
+    def _rejection_node(self, state: TravelState) -> dict[str, Any]:
+        """Stream the guardrail rejection via a real LLM call.
+
+        Using create_agent (like _clarify_node does) ensures the base-class
+        streaming infrastructure sees live AIMessageChunk events and emits
+        proper TEXT_MESSAGE_* events to the frontend.
+        """
+        raw_rejection = state.get("guardrail_rejection", "")
+        prompt_text = (
+            f"Please communicate the following to the user in a friendly, natural way:\n"
+            f"{raw_rejection}"
+        )
+        result = self._rejection_agent.invoke({"messages": [HumanMessage(content=prompt_text)]})
+        friendly_rejection = _last_ai_content(result)
+
+        return {
+            "messages": [AIMessage(content=friendly_rejection)],
+            "guardrail_blocked": False,
+            "guardrail_rejection": "",
+        }
 
     # ------------------------------------------------------------------
     # Node: intake_node
@@ -736,6 +874,8 @@ class MyAgent(LangGraphAgent):
         graph: StateGraph[TravelState] = StateGraph(TravelState)
 
         # Register nodes
+        graph.add_node("guardrail_node", self._guardrail_node)
+        graph.add_node("rejection_node", self._rejection_node)
         graph.add_node("intake_node", self._intake_node)
         graph.add_node("clarify_node", self._clarify_node)
         graph.add_node("confirm_node", self._confirm_node)
@@ -745,8 +885,15 @@ class MyAgent(LangGraphAgent):
         graph.add_node("planner_node", self._planner_node)
         graph.add_node("presenter_node", self._presenter_node)
 
-        # Entry point
-        graph.add_edge(START, "intake_node")
+        # Entry point — guardrail runs first, blocks unsafe/off-topic input
+        graph.add_edge(START, "guardrail_node")
+        graph.add_conditional_edges(
+            "guardrail_node",
+            _route_guardrail,
+            {"rejection_node": "rejection_node", "intake_node": "intake_node"},
+        )
+        # Rejection streams the decline message then terminates
+        graph.add_edge("rejection_node", END)
 
         # Intake → clarify (missing fields) | confirm (show summary) | supervisor (confirmed)
         graph.add_conditional_edges(
